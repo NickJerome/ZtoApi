@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1555,7 +1557,8 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 
 	// 构建带URL参数的完整URL
 	baseURL := UPSTREAM_URL
-	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+	timestampMs := time.Now().UnixMilli()
+	timestamp := fmt.Sprintf("%d", timestampMs)
 	
 	// 生成UUID (简化版，使用crypto/rand会更好)
 	requestID := fmt.Sprintf("%x-%x-%x-%x-%x", 
@@ -1595,11 +1598,12 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 		return nil, err
 	}
 
-	// 生成 X-Signature - 基于请求体的 SHA-256 哈希（426错误修复）
-	hash := sha256.Sum256(reqBody)
-	signature := fmt.Sprintf("%x", hash)
+	// 生成 X-Signature - 与上游一致的HMAC算法
+	signaturePayload := fmt.Sprintf("requestId,%s,timestamp,%s,user_id,%s", requestID, timestamp, userID)
+	userMessage := getLastUserMessage(upstreamReq.Messages)
+	signature := generateSignature(signaturePayload, userMessage, timestampMs)
 	
-	debugLog("生成签名: %s (基于请求体SHA256)", signature)
+	debugLog("生成签名: %s (基于HMAC-SHA256)", signature)
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
@@ -1630,6 +1634,31 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 
 	debugLog("上游响应状态: %d %s", resp.StatusCode, resp.Status)
 	return resp, nil
+}
+
+// getLastUserMessage returns the latest user message content for signing.
+func getLastUserMessage(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(messages[i].Role, "user") {
+			return messages[i].Content
+		}
+	}
+	return ""
+}
+
+// generateSignature replicates the upstream HMAC signature algorithm.
+func generateSignature(e, t string, timestampMs int64) string {
+	n := timestampMs / int64(5*60*1000)
+	nStr := fmt.Sprintf("%d", n)
+	firstHMAC := hmac.New(sha256.New, []byte("junjie"))
+	firstHMAC.Write([]byte(nStr))
+	intermediateKey := hex.EncodeToString(firstHMAC.Sum(nil))
+
+	message := fmt.Sprintf("%s|%s|%d", e, t, timestampMs)
+	finalHMAC := hmac.New(sha256.New, []byte(intermediateKey))
+	finalHMAC.Write([]byte(message))
+
+	return hex.EncodeToString(finalHMAC.Sum(nil))
 }
 
 func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string, startTime time.Time, path string, clientIP, userAgent string) {
